@@ -358,6 +358,11 @@ def assert_one(a: dict[str, Any], res: CaseResult) -> tuple[bool, str]:
         flags = re.IGNORECASE if ci else 0
         return bool(re.search(a["pattern"], text, flags)), f"no match for /{a['pattern']}/"
 
+    if t == "not_regex":
+        flags = re.IGNORECASE if ci else 0
+        matched = re.search(a["pattern"], text, flags)
+        return not bool(matched), f"unexpectedly matched /{a['pattern']}/ at {matched.group(0)!r}" if matched else "ok"
+
     if t == "tool_called":
         want = a["tool"]
         return want in res.tool_calls, f"tool {want!r} not in {res.tool_calls or '[]'}"
@@ -419,7 +424,7 @@ def _judge(a: dict[str, Any], res: CaseResult) -> tuple[bool, str]:
 
             judge = _JUDGE_CACHE.get("agent")
             if judge is None:
-                judge = AIAgent(
+                judge_kwargs: dict[str, Any] = dict(
                     model=cfg.get("judge_model", cfg["model"]),
                     quiet_mode=True,
                     skip_memory=True,
@@ -427,11 +432,21 @@ def _judge(a: dict[str, Any], res: CaseResult) -> tuple[bool, str]:
                     disabled_toolsets=["terminal", "browser", "web"],
                     max_iterations=1,
                 )
+                # Pass explicit base_url/api_key to judge so it uses the same
+                # endpoint as the main agent (avoids falling through to the
+                # deployed config's fallback_providers which may use expired keys).
+                if cfg.get("base_url"):
+                    judge_kwargs["base_url"] = cfg["base_url"]
+                if cfg.get("api_key"):
+                    judge_kwargs["api_key"] = cfg["api_key"]
+                judge = AIAgent(**judge_kwargs)
                 _JUDGE_CACHE["agent"] = judge
             raw = judge.chat(prompt)
-            err = None
+            err = None if raw is not None else "judge.chat() returned None (model error or empty response)"
         if err:
             return False, f"judge error: {err}"
+        if raw is None:
+            return False, "judge returned None (model error or empty response)"
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         score = float(json.loads(m.group(0))["score"]) if m else 0.0
         return score >= threshold, f"judge score {score:.2f} (>= {threshold} required)"
@@ -696,6 +711,39 @@ def main() -> int:
     paths: list[str] = []
     for pat in args.suite:
         paths.extend(sorted(glob.glob(pat)) or [pat])
+
+    # Pre-eval tool deregistration: if any suite specifies `deregister_tools`,
+    # remove those tools from the global registry BEFORE any cases run.
+    # This is the safe, surgical mechanism to prevent write-capable tools
+    # (e.g. skill_manage) from contaminating skill files during eval runs.
+    # The deregistration is global and permanent for this process lifetime,
+    # which is the desired behavior — eval sessions must never mutate state.
+    #
+    # IMPORTANT: tool files (e.g. skill_manager_tool.py) are only imported
+    # when `run_agent.AIAgent` is first imported (lazy import inside run_library).
+    # We must force that import NOW — before the worker threads start — so the
+    # tools are actually registered in the registry before we try to deregister
+    # them. Without this, deregister() is a no-op and the tools get re-registered
+    # on the first run_library() call.
+    _tools_to_deregister: list[str] = []
+    for path in paths:
+        with open(path) as _fh:
+            _doc = yaml.safe_load(_fh)
+        _tools_to_deregister.extend(_doc.get("deregister_tools") or [])
+
+    if args.backend == "library" and _tools_to_deregister:
+        try:
+            # Force-import run_agent so all tool files are registered.
+            import run_agent as _run_agent_mod  # noqa: F401
+        except Exception as _exc:
+            print(f"[eval] WARNING: could not pre-import run_agent for deregistration: {_exc}")
+        for _tool_name in _tools_to_deregister:
+            try:
+                from tools.registry import registry as _registry
+                _registry.deregister(_tool_name)
+                print(f"[eval] deregistered tool '{_tool_name}' (anti-contamination)")
+            except Exception as _exc:
+                print(f"[eval] WARNING: could not deregister '{_tool_name}': {_exc}")
 
     all_results: list[CaseResult] = []
     overall_name = ", ".join(os.path.basename(p) for p in paths)
