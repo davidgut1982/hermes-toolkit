@@ -670,8 +670,35 @@ def main() -> int:
     # concrete model, so fall back to the env/historic placeholder. model_is_default
     # records "the user did not pass --model", which run_library uses to prefer the
     # deployed model on a bare invocation.
+    #
+    # NOTE on the built-in fallback model: when neither --model nor HERMES_QA_MODEL is
+    # set, the harness silently falls back to a generic default. A weak default model is
+    # a SAFETY TRAP for safety-critical skills: a weak judge/model reads explicit
+    # POST-ONLY / auth-refusal rules and ignores them, producing FALSE "BLOCK" verdicts
+    # (this bit us in a real session — qwen/qwen3-32b sailed past explicit refusal rules).
+    # We do NOT hardcode a new paid default here — the existing default is preserved and
+    # we warn loudly (once, to stderr) so the caller knows they are on the bare fallback
+    # and must pass a representative runtime model for safety-critical skills.
+    _BUILTIN_FALLBACK_MODEL = "anthropic/claude-sonnet-4.6"
     model_is_default = args.model is None
-    model = args.model or os.environ.get("HERMES_QA_MODEL", "anthropic/claude-sonnet-4.6")
+    _env_model = os.environ.get("HERMES_QA_MODEL")
+    model = args.model or _env_model or _BUILTIN_FALLBACK_MODEL
+    if model_is_default and not _env_model:
+        # No explicit --model AND no HERMES_QA_MODEL: we are on the bare built-in
+        # fallback. Warn once, loudly, to stderr. (The library backend may still adopt
+        # the DEPLOYED model downstream — but api/cli backends and --bare runs use this
+        # value verbatim, so the trap is real for them. A weak default such as
+        # qwen/qwen3-32b silently passes safety-critical refusal/POST-ONLY/auth checks
+        # and yields false BLOCK verdicts.)
+        print(
+            f"[eval][WARN] No --model/HERMES_QA_MODEL set; defaulting to the built-in "
+            f"fallback {_BUILTIN_FALLBACK_MODEL}. A weak fallback model (e.g. "
+            f"qwen/qwen3-32b) is UNRELIABLE for safety-critical skills "
+            f"(refusal/POST-ONLY/auth rules) — it produces false BLOCK verdicts. Pass "
+            f"--model with a representative runtime model (e.g. the skill's production "
+            f"model, deepseek/deepseek-v4-flash, or a Sonnet-class control).",
+            file=sys.stderr,
+        )
 
     runtime = {
         "backend": args.backend,
